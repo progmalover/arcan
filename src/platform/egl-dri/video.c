@@ -98,9 +98,12 @@
 #include <libdrm/drm_mode.h>
 #include <libdrm/drm_fourcc.h>
 
-#define MESA_EGL_NO_X11_HEADERS
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
+#include "../EGL/egl.h"
+#include "../EGL/eglext.h"
+
+#if !defined(EGL_DRM_MASTER_FD_EXT)
+#define EGL_DRM_MASTER_FD_EXT                   0x333C
+#endif
 
 /*
  * Other refactoring project -- see if we can extract out what we need from
@@ -123,11 +126,73 @@
 #include "libbacklight.h"
 
 /*
- * extensions needed for buffer passing
+ * Dynamically load all EGL function use, and look them up with dlsym if we're
+ * dynamically linked against the EGL library already (for the devices where an
+ * explicit library isn't defined). Since we synch a copy of the KHR EGL
+ * headers there shouldn't be a conflict with the locally defined ones.
  */
-static PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
-static PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
-static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+typedef void* GLeglImageOES;
+typedef void (EGLAPIENTRY* PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum target, GLeglImageOES image);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLCHOOSECONFIGPROC)(EGLDisplay dpy, const EGLint *attrib_list,	EGLConfig *configs, EGLint config_size,	EGLint *num_config);
+typedef EGLContext  (EGLAPIENTRY* PFNEGLCREATECONTEXTPROC)(EGLDisplay dpy, EGLConfig config, EGLContext share_context, const EGLint *attrib_list);
+typedef EGLSurface  (EGLAPIENTRY* PFNEGLCREATEWINDOWSURFACEPROC)(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint *attrib_list);
+typedef EGLint      (EGLAPIENTRY* PFNEGLGETERRORPROC)(void);
+typedef EGLDisplay  (EGLAPIENTRY* PFNEGLGETDISPLAYPROC)(EGLNativeDisplayType display_id);
+typedef void* (EGLAPIENTRY* PFNEGLGETPROCADDRESSPROC)(const char *procname);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLINITIALIZEPROC)
+	(EGLDisplay dpy, EGLint *major, EGLint *minor);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLMAKECURRENTPROC)
+	(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLDESTROYCONTEXTPROC)
+	(EGLDisplay dpy, EGLContext ctx);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLDESTROYSURFACEPROC)
+	(EGLDisplay dpy, EGLSurface surface);
+typedef const char* (EGLAPIENTRY* PGNEGLQUERYSTRINGPROC)
+	(EGLDisplay dpy, EGLint name);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLSWAPBUFFERSPROC)
+	(EGLDisplay dpy, EGLSurface surface);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLSWAPINTERVALPROC)
+	(EGLDisplay dpy, EGLint interval);
+typedef EGLBoolean  (EGLAPIENTRY* PFNEGLTERMINATEPROC)
+	(EGLDisplay dpy);
+typedef EGLBoolean (EGLAPIENTRY* PFNEGLBINDAPIPROC)(EGLenum);
+typedef EGLBoolean (EGLAPIENTRY* PFNEGLGETCONFIGSPROC)
+	(EGLDisplay, EGLConfig*, EGLint, EGLint*);
+typedef const char* (EGLAPIENTRY* PFNEGLQUERYSTRINGPROC)(EGLDisplay, EGLenum);
+
+struct egl_env {
+/* EGLImage */
+	PFNEGLCREATEIMAGEKHRPROC create_image;
+	PFNEGLDESTROYIMAGEKHRPROC destroy_image;
+	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture2D;
+
+/* EGLStreams */
+	PFNEGLQUERYDEVICESEXTPROC query_devices;
+	PFNEGLQUERYDEVICESTRINGEXTPROC query_device_string;
+	PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display;
+	PFNEGLGETOUTPUTLAYERSEXTPROC get_output_layers;
+	PFNEGLCREATESTREAMKHRPROC create_stream;
+	PFNEGLSTREAMCONSUMEROUTPUTEXTPROC stream_consumer_output;
+	PFNEGLCREATESTREAMPRODUCERSURFACEKHRPROC create_stream_producer_surface;
+
+/* Basic EGL */
+	PFNEGLDESTROYSURFACEPROC destroy_surface;
+	PFNEGLGETERRORPROC get_error;
+	PFNEGLCREATEWINDOWSURFACEPROC create_window_surface;
+	PFNEGLMAKECURRENTPROC make_current;
+	PFNEGLGETDISPLAYPROC get_display;
+	PFNEGLINITIALIZEPROC initialize;
+	PFNEGLBINDAPIPROC bind_api;
+	PFNEGLGETCONFIGSPROC get_configs;
+	PFNEGLCHOOSECONFIGPROC choose_config;
+	PFNEGLCREATECONTEXTPROC create_context;
+	PFNEGLGETPROCADDRESSPROC get_proc_address;
+	PFNEGLDESTROYCONTEXTPROC destroy_context;
+	PFNEGLTERMINATEPROC terminate;
+	PFNEGLQUERYSTRINGPROC query_string;
+	PFNEGLSWAPBUFFERSPROC swap_buffers;
+	PFNEGLSWAPINTERVALPROC swap_interval;
+};
 
 /*
  * real heuristics scheduled for 0.5.3, see .5 at top
@@ -139,8 +204,9 @@ static char* egl_synchopts[] = {
 
 static char* egl_envopts[] = {
 	"ARCAN_VIDEO_DEVICE=/dev/dri/card0", "specifiy primary device",
-	"ARCAN_VIDEO_CONNECTOR=conn_ind", "primary display connector (invalid lists)",
-	"ARCAN_VIDEO_DRM_MASTER", "fail if drmMaster can't be obtained",
+	"ARCAN_VIDEO_CONNECTOR=conn_ind", "primary display connector",
+	"ARCAN_VIDEO_DUMP", "set to dump- output connectors and exit",
+	"ARCAN_VIDEO_DRM_MASTER", "fail hard if drmMaster can't be obtained",
 	"ARCAN_VIDEO_WAIT_CONNECTOR", "loop until an active connector is found",
 	"ARCAN_VIDEO_ALLOW_AUTH", "allow clients to auth against master (insecure)",
 	NULL
@@ -165,6 +231,13 @@ struct dev_node {
 	EGLConfig config;
 	EGLContext context;
 	EGLDisplay display;
+
+/*
+ * to deal with multiple GPUs and multiple vendor libraries, these contexts are
+ * managed per display and explicitly referenced / switched when we need to.
+ */
+	struct egl_env eglenv;
+	struct agp_fenv* agpenv;
 };
 
 enum disp_state {
@@ -176,20 +249,21 @@ enum disp_state {
 };
 
 /*
- * Multiple- device nodes (i.e. cards) is currently untested
- * and thus only partially implemented due to lack of hardware
+ * Multiple cards is still a WIP, just incrementing these won't work.
  */
 static const int MAX_NODES = 1;
 static struct dev_node nodes[1];
 
 /*
  * aggregation struct that represent one triple of display, card, bindings
+ *
  */
 struct dispout {
 /* connect drm, gbm and EGLs idea of a device */
 	struct dev_node* device;
 
-/* 1 buffer for 1 device for 1 display */
+/* the output buffers, actual fields use will vary with underlying
+ * methid, i.e. different for normal gbm, headless gbm and eglstreams */
 	struct {
 		int in_flip, in_destroy;
 		EGLSurface esurf;
@@ -213,21 +287,20 @@ struct dispout {
 		uint16_t* orig_gamma;
 	} display;
 
-/* v-store mapping, with texture blitting options and possibly mapping hint */
+/* internal v-store and system mappings, rules for drawing final output */
 	arcan_vobj_id vid;
-	size_t dispw, disph, dispx, dispy;;
+	size_t dispw, disph, dispx, dispy;
 	_Alignas(16) float projection[16];
 	_Alignas(16) float txcos[8];
-
-/* backlight is "a bit" quirky, we register a custom led controller that
- * is processed while we're synching- where the subleds correspond to the
- * displayid of the display */
-	struct backlight* backlight;
-	long backlight_brightness;
-
 	enum blitting_hint hint;
 	enum disp_state state;
 	platform_display_id id;
+
+/* backlight is "a bit" quirky, we register a custom led controller that
+ * is shared for all displays and processed while we're busy synching.
+ * Subleds on this controller match the displayid of the display */
+	struct backlight* backlight;
+	long backlight_brightness;
 };
 
 static struct {
@@ -359,7 +432,7 @@ static void sigsegv_errmsg(int sign)
 
 static const char* egl_errstr()
 {
-	EGLint errc = eglGetError();
+	EGLint errc = egl_dri.last_display->device->eglenv.get_error();
 	switch(errc){
 	case EGL_SUCCESS:
 		return "Success";
@@ -396,7 +469,60 @@ static const char* egl_errstr()
 	}
 }
 
-static int setup_buffers(struct dispout* d)
+static int setup_buffers_stream(struct dispout* d)
+{
+/* WE NEED:
+ *  EGL_EXT_device_base,
+ *  EGL_EXT_device_enumeration,
+ *  EGL_EXT_device_query,
+ * 	EGL_EXT_output_base,
+ * 	EGL_EXT_output_drm,
+ * 	EGL_KHR_stream,
+ * 	EGL_EXT_stream_consumer_egloutput,
+ * 	EGL_KHR_stream_producer_eglsurface,
+ *
+ * 	EGLint layer_attrs[] = {
+ * 		EGL_DRM_PLANE_EXT,
+ * 		plane_id,
+ * 		EGL_NONE
+ * 	};
+ *
+ *  EGLint stream_attrs[] = {
+ *  	EGL_NONE
+ *  }'
+ *
+ * 	EGLint surf_attrs[] = {
+ * 		EGL_WIDTH, width,
+ * 		EGL_HEIGHT, height
+ * 	};
+ *
+ * 	ON DISPLAY creation:
+ * 	EGL_EXT_platform_device
+ * 	EGL_EXT_platform_base
+ *  EGL_EXT_device_drm
+ *
+ *  DisplayAttrs[] = {
+ *  	DGL_DRM_MASTER_FD_EXT,
+ *  	drmFd,
+ *  	EGL_NONE
+ *  };
+ *  eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, (void*) device, DisplayAttrs);
+ */
+
+/*
+ * THEN:
+ * egl_get_output_layers(egl_display, layer_attrs, &eglLayer, 1, &n)
+ * egl_create_stream(egl_display, stream_attrs);
+ * egl_stream_consumer_output(egl_display, egl_stream, egl_layer);
+ *
+ * FINALLY:
+ *	d->buffer.surface = egl_create_stream_producer_surface(
+	  	egl_display, egl_config, egl_stream, surface_attribs);
+ */
+	return -1;
+}
+
+static int setup_buffers_gbm(struct dispout* d)
 {
 	SET_SEGV_MSG("libgbm(), creating scanout buffer"
 		" failed catastrophically.\n")
@@ -416,15 +542,15 @@ static int setup_buffers(struct dispout* d)
 	);
 #endif
 
-	d->buffer.esurf = eglCreateWindowSurface(d->device->display,
-		d->device->config, (uintptr_t)d->buffer.surface, NULL);
+	d->buffer.esurf = d->device->eglenv.create_window_surface(
+		d->device->display, d->device->config, (uintptr_t)d->buffer.surface, NULL);
 
 	if (d->buffer.esurf == EGL_NO_SURFACE) {
 		arcan_warning("egl-dri() -- couldn't create a window surface.\n");
 		return -1;
 	}
 
-	eglMakeCurrent(d->device->display, d->buffer.esurf,
+	d->device->eglenv.make_current(d->device->display, d->buffer.esurf,
 		d->buffer.esurf, d->device->context);
 
 	return 0;
@@ -487,7 +613,7 @@ bool platform_video_set_mode(platform_display_id disp, platform_mode_id mode)
 	}
 */
 	d->state = DISP_CLEANUP;
-	eglDestroySurface(d->device->display, d->buffer.esurf);
+	d->device->eglenv.destroy_surface(d->device->display, d->buffer.esurf);
 
 /*
  * drop current framebuffers
@@ -506,7 +632,7 @@ bool platform_video_set_mode(platform_display_id disp, platform_mode_id mode)
 /*
  * setup / allocate a new set of buffers that match the new mode
  */
-	setup_buffers(d);
+	setup_buffers_gbm(d);
 	d->state = DISP_MAPPED;
 
 	return true;
@@ -609,18 +735,71 @@ bool platform_video_specify_mode(
 	return false;
 }
 
-static bool map_extensions()
+/*
+ * Recall, one of the many ***s in graphics programming at this level is that
+ * even though a symbol is exposed, doesn't mean that you should call it. The
+ * wise men at Khronos decided that you should also verify them against a list
+ * of strings, and of course write the parser yourself.
+ */
+static void map_functions(struct egl_env* denv,
+	void*(lookup)(void* tag, const char* sym, bool req), void* tag)
 {
-	eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)
-		eglGetProcAddress("eglCreateImageKHR");
+/* Mapping dma_buf */
+	denv->create_image = (PFNEGLCREATEIMAGEKHRPROC)
+		lookup(tag, "eglCreateImageKHR", false);
+	denv->destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)
+		lookup(tag, "eglDestroyImageKHR", false);
+	denv->image_target_texture2D = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
+		lookup(tag, "glEGLImageTargetTexture2DOES", false);
 
-	eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)
-		eglGetProcAddress("eglDestroyImageKHR");
+/* EGLStreams */
+	denv->query_devices = (PFNEGLQUERYDEVICESEXTPROC)
+		lookup(tag, "eglQueryDevicesEXT", false);
+	denv->query_device_string = (PFNEGLQUERYDEVICESTRINGEXTPROC)
+		lookup(tag, "eglQueryDeviceStringEXT", false);
+	denv->get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)
+		lookup(tag, "eglGetPlatformDisplayEXT", false );
+	denv->get_output_layers = (PFNEGLGETOUTPUTLAYERSEXTPROC)
+		lookup(tag, "eglGetOutputLayersEXT", false);
+	denv->create_stream = (PFNEGLCREATESTREAMKHRPROC)
+		lookup(tag, "eglCreateStreamKHR", false);
+  denv->stream_consumer_output = (PFNEGLSTREAMCONSUMEROUTPUTEXTPROC)
+		lookup(tag, "eglStreamConsumerOutputEXT", false);
+	denv->create_stream_producer_surface = (PFNEGLCREATESTREAMPRODUCERSURFACEKHRPROC)
+		lookup(tag, "eglCreateStreamProducerSurfaceKHR", false);
 
-	glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
-		eglGetProcAddress("glEGLImageTargetTexture2DOES");
-
-	return true;
+/* basic EGL */
+	denv->destroy_surface =
+		(PFNEGLDESTROYSURFACEPROC) lookup(tag, "eglDestroySurface", true);
+	denv->get_error =
+		(PFNEGLGETERRORPROC) lookup(tag, "eglGetError", true);
+	denv->create_window_surface =
+		(PFNEGLCREATEWINDOWSURFACEPROC) lookup(tag, "eglCreateWindowSurface", true);
+	denv->make_current =
+		(PFNEGLMAKECURRENTPROC) lookup(tag, "eglMakeCurrent", true);
+	denv->get_display =
+		(PFNEGLGETDISPLAYPROC) lookup(tag, "eglGetDisplay", true);
+	denv->initialize =
+		(PFNEGLINITIALIZEPROC) lookup(tag, "eglInitialize", true);
+	denv->bind_api =
+		(PFNEGLBINDAPIPROC) lookup(tag, "eglBindAPI", true);
+	denv->get_configs =
+		(PFNEGLGETCONFIGSPROC) lookup(tag, "eglGetConfigs", true);
+	denv->choose_config =
+		(PFNEGLCHOOSECONFIGPROC) lookup(tag, "eglChooseConfig", true);
+	denv->create_context =
+		(PFNEGLCREATECONTEXTPROC) lookup(tag, "eglCreateContext", true);
+	denv->get_proc_address =
+		(PFNEGLGETPROCADDRESSPROC) lookup(tag, "eglGetProcAddress", true);
+	denv->destroy_context =
+		(PFNEGLDESTROYCONTEXTPROC) lookup(tag, "eglDestroyContext", true);
+	denv->terminate = (PFNEGLTERMINATEPROC) lookup(tag, "eglTerminate", true);
+	denv->query_string =
+		(PFNEGLQUERYSTRINGPROC) lookup(tag, "eglQueryString", true);
+	denv->swap_buffers =
+		(PFNEGLSWAPBUFFERSPROC) lookup(tag, "eglSwapBuffers", true);
+	denv->swap_interval =
+		(PFNEGLSWAPINTERVALPROC) lookup(tag, "eglSwapInterval", true);
 }
 
 static void drm_mode_tos(FILE* dst, unsigned val)
@@ -1008,6 +1187,11 @@ static int setup_node(struct dev_node* node, const char* path, int fd)
 		EGL_NONE
 	};
 
+/* right now, this platform won't support anything that isn't rendering using
+ * xGL,VK/EGL which will be a problem for a software based AGP. When we get
+ * one, we need a fourth scanout path (ffs) where the worldid rendertarget
+ * writes into the scanout buffer immediately. It might be possibly for that
+ * AGP to provide a 'faux' EGL implementation though */
 	size_t i = 0;
 	if (strcmp(ident, "OPENGL21") == 0){
 		apiv = EGL_OPENGL_API;
@@ -1032,14 +1216,22 @@ static int setup_node(struct dev_node* node, const char* path, int fd)
 	else
 		return -2;
 
+/* we don't have a mechanism for specifying/pairing GL/EGL implementation with
+ * a device for now, the general idea is that GLVnd should provide this
+ * indirection for us, but that only shifts the problem and doesn't really
+ * apply in this case where we have knowledge/control. The end- approach is
+ * that we'll have config-file templates that just maps the config into the
+ * database as the reserved 'arcan' appl_kv store, and use that to specify
+ * device, method and lib */
+
 	SET_SEGV_MSG("EGL-dri(), getting the display failed\n");
 /*
  * first part of GL setup, we create the display,
  * config and device as they seem to be on a per-GPU basis
  */
 
-	node->display = eglGetDisplay((void*)(node->gbm));
-	if (!eglInitialize(node->display, NULL, NULL)){
+	node->display = node->eglenv.get_display((void*)(node->gbm));
+	if (!node->eglenv.initialize(node->display, NULL, NULL)){
 		arcan_warning("egl-dri() -- failed to initialize EGL.\n");
 		goto reset_node;
 	}
@@ -1047,7 +1239,7 @@ static int setup_node(struct dev_node* node, const char* path, int fd)
 /*
  * make sure the API we've selected match the AGP platform
  */
-	if (!eglBindAPI(apiv)){
+	if (!node->eglenv.bind_api(apiv)){
 		arcan_warning("egl-dri() -- couldn't bind GL API.\n");
 		goto reset_node;
 	}
@@ -1056,7 +1248,7 @@ static int setup_node(struct dev_node* node, const char* path, int fd)
  * grab and activate config
  */
 	EGLint nc;
-	eglGetConfigs(node->display, NULL, 0, &nc);
+	node->eglenv.get_configs(node->display, NULL, 0, &nc);
 	if (nc < 1){
 		arcan_warning(
 			"egl-dri() -- no configurations found (%s).\n", egl_errstr());
@@ -1070,9 +1262,10 @@ static int setup_node(struct dev_node* node, const char* path, int fd)
 	arcan_warning(
 		"egl-dri() -- %d configurations found.\n", (int) nc);
 
-	if (!eglChooseConfig(node->display, attribs, &node->config, 1, &selv)){
-		arcan_warning(
-			"egl-dri() -- couldn't chose a configuration (%s).\n", egl_errstr());
+	if (!node->eglenv.choose_config(
+		node->display, attribs, &node->config, 1, &selv)){
+		arcan_warning("egl-dri() -- couldn't chose a configuration (%s).\n",
+			egl_errstr());
 		free(configs);
 		goto reset_node;
 	}
@@ -1081,8 +1274,8 @@ static int setup_node(struct dev_node* node, const char* path, int fd)
  * finally create a context to match, the last part of egl
  * setup, comes when more of the stack is up and running
  */
-	node->context = eglCreateContext(node->display, node->config,
-		EGL_NO_CONTEXT, context_attribs);
+	node->context = node->eglenv.create_context(node->display,
+		node->config, EGL_NO_CONTEXT, context_attribs);
 	if (node->context == NULL) {
 		arcan_warning("egl-dri() -- couldn't create a context.\n");
 		goto reset_node;
@@ -1102,6 +1295,21 @@ reset_node:
 	return -1;
 }
 
+/*
+ * For ATOMIC:
+ * 1. we need to know that it is supported:
+ *    drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES),
+ *    drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC),
+ *
+ *    then pick connector, pick plane -> config
+ *    then pick modeID from config
+ *
+ * 2. then drmModeAtomicAlloc()
+ *    AssignAtomicRequest(fd, atomic, config, modeid, fb)
+ *    drmModeAtomicCommit(fd, atomic, flags, NULL);
+ *    drmModeAtomicFree(atomi)
+ *
+ */
 static int setup_kms(struct dispout* d, int conn_id, size_t w, size_t h)
 {
 	SET_SEGV_MSG("egl-dri(), enumerating connectors on device failed.\n");
@@ -1279,7 +1487,12 @@ bool platform_video_map_handle(
 		EGL_NONE
 	};
 
-	if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES)
+/*
+ * MULTIGPU:FAIL
+ * we need to follow the affinity for the specific [dst], and run the procedure
+ * for each set bit in the field, if it is even possible to do with PRIME etc.
+ */
+	if (!nodes[0].eglenv.create_image || !nodes[0].eglenv.image_target_texture2D)
 		return false;
 
 /*
@@ -1290,7 +1503,8 @@ bool platform_video_map_handle(
  * buffer manually.
  */
 	if (0 != dst->vinf.text.tag){
-		eglDestroyImageKHR(nodes[0].display, (EGLImageKHR) dst->vinf.text.tag);
+		nodes[0].eglenv.destroy_image(
+			nodes[0].display, (EGLImageKHR) dst->vinf.text.tag);
 		dst->vinf.text.tag = 0;
 
 /*
@@ -1311,7 +1525,8 @@ bool platform_video_map_handle(
  * in addition, we actually need to know which render-node this
  * little bugger comes from, this approach is flawed for multi-gpu
  */
-	EGLImageKHR img = eglCreateImageKHR(nodes[0].display,
+	EGLImageKHR img = nodes[0].eglenv.create_image(
+		nodes[0].display,
 		EGL_NO_CONTEXT,
 		EGL_LINUX_DMA_BUF_EXT,
 		(EGLClientBuffer)NULL, attrs
@@ -1329,7 +1544,7 @@ bool platform_video_map_handle(
 /* other option ?
  * EGLImage -> gbm_bo -> glTexture2D with EGL_NATIVE_PIXMAP_KHR */
 	agp_activate_vstore(dst);
-	glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img);
+	nodes[0].eglenv.image_target_texture2D(GL_TEXTURE_2D, img);
 	dst->vinf.text.tag = (uintptr_t) img;
 	dst->vinf.text.handle = handle;
 	agp_deactivate_vstore(dst);
@@ -1503,10 +1718,10 @@ static void disable_display(struct dispout* d, bool dealloc)
 	}
 
 	d->state = DISP_CLEANUP;
-	eglMakeCurrent(d->device->display, EGL_NO_SURFACE,
-		EGL_NO_SURFACE, d->device->context);
+	d->device->eglenv.make_current(d->device->display,
+		EGL_NO_SURFACE, EGL_NO_SURFACE, d->device->context);
 
-	eglDestroySurface(d->device->display, d->buffer.esurf);
+	d->device->eglenv.destroy_surface(d->device->display, d->buffer.esurf);
 	d->buffer.esurf = NULL;
 
 	if (d->buffer.cur_fb){
@@ -1603,7 +1818,7 @@ struct monitor_mode platform_video_dimensions()
 
 void* platform_video_gfxsym(const char* sym)
 {
-	return eglGetProcAddress(sym);
+	return nodes[0].eglenv.get_proc_address(sym);
 }
 
 static void do_led(struct dispout* disp, uint8_t val)
@@ -1697,7 +1912,6 @@ retry_card:
 		arcan_warning("platform/egl-dri(), couldn't get drmMaster (%s), trying "
 			" to continue anyways.\n", strerror(errno));
 	}
-	map_extensions();
 
 /*
  * if w, h are set it acts as a hint to the resolution that we will request.
@@ -1706,6 +1920,10 @@ retry_card:
 	struct dispout* d = allocate_display(&nodes[0]);
 	d->display.primary = true;
 	egl_dri.last_display = d;
+
+	if (getenv("ARCAN_VIDEO_DUMP")){
+		goto cleanup;
+	}
 
 /*
  * force connector is a workaround for dealing with explicitly getting a single
@@ -1739,7 +1957,7 @@ retry_card:
 		goto cleanup;
 	}
 
-	if (setup_buffers(d) != 0){
+	if (setup_buffers_gbm(d) != 0){
 		disable_display(d, true);
 		goto cleanup;
 	}
@@ -1989,7 +2207,7 @@ void platform_video_shutdown()
 		if (0 >= nodes[i].fd)
 			continue;
 
-		eglDestroyContext(nodes[i].display, nodes[i].context);
+		nodes[i].eglenv.destroy_context(nodes[i].display, nodes[i].context);
 		gbm_device_destroy(nodes[i].gbm);
 
 		if (nodes[0].master)
@@ -1997,9 +2215,8 @@ void platform_video_shutdown()
 		close(nodes[i].fd);
 
 		nodes[i].fd = -1;
-		eglTerminate(nodes[i].display);
+		nodes[i].eglenv.terminate(nodes[i].display);
 	}
-
 }
 
 void platform_video_setsynch(const char* arg)
@@ -2039,12 +2256,12 @@ const char* platform_video_capstr()
 	const char* exts = (const char*) glGetString(GL_EXTENSIONS);
 
 	const char* eglexts = "";
+	struct dispout* disp = get_display(0);
 
-	if (get_display(0)){
-		eglexts = (const char*)eglQueryString(
-		get_display(0)->device->display, EGL_EXTENSIONS);
-
-		dump_connectors(stream, get_display(0)->device, true);
+	if (disp){
+		eglexts = (const char*)disp->device->eglenv.query_string(
+		disp->device->display, EGL_EXTENSIONS);
+		dump_connectors(stream, disp->device, true);
 	}
 	fprintf(stream, "Video Platform (EGL-DRI)\n"
 			"Vendor: %s\nRenderer: %s\nGL Version: %s\n"
@@ -2097,7 +2314,7 @@ bool platform_video_map_display(
 			d->display.con->connector_id,
 			d->display.mode ? d->display.mode->hdisplay : 0,
 			d->display.mode ? d->display.mode->vdisplay : 0) ||
-			setup_buffers(d) != 0){
+			setup_buffers_gbm(d) != 0){
 			arcan_warning("egl-dri(map_display) - couldn't setup kms/"
 				"buffers on %d:%d\n", (int)d->id, (int)d->display.con->connector_id);
 			return false;
@@ -2197,8 +2414,8 @@ static void update_display(struct dispout* d)
  * current_fbid* drawing hints, mapping etc. should be taken into account here,
  * there's quite possible drm flags to set scale here
  */
-	eglMakeCurrent(d->device->display, d->buffer.esurf,
-		d->buffer.esurf, d->device->context);
+	d->device->eglenv.make_current(d->device->display,
+		d->buffer.esurf, d->buffer.esurf, d->device->context);
 
 /*
  * for when we map fullscreen, have multi-buffering and garbage from previous
@@ -2217,7 +2434,7 @@ static void update_display(struct dispout* d)
  * draw calls - and forward this list here.
  */
 	draw_display(d);
-	eglSwapBuffers(d->device->display, d->buffer.esurf);
+	d->device->eglenv.swap_buffers(d->device->display, d->buffer.esurf);
 
 /* next/cur switching comes in the page-flip handler */
 	struct gbm_bo* bo = gbm_surface_lock_front_buffer(d->buffer.surface);
@@ -2320,7 +2537,7 @@ void platform_video_restore_external()
 			if (setup_kms(&displays[i], displays[i].display.con->connector_id, 0, 0) != 0){
 				disable_display(&displays[i], true);
 			}
-			else if (setup_buffers(&displays[i]) != 0){
+			else if (setup_buffers_gbm(&displays[i]) != 0){
 				disable_display(&displays[i], true);
 			}
 			displays[i].state = DISP_MAPPED;
